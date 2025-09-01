@@ -1,7 +1,7 @@
 # ga4_to_bq.py
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import os
 from typing import Iterable, List, Dict, Any
 
@@ -66,9 +66,8 @@ def _ensure_table():
 
     table_ref = dataset_ref.table(BQ_TABLE_RAW)
     try:
-        table = bq.get_table(table_ref)
-        # si existe, nada
-        return
+        _ = bq.get_table(table_ref)
+        return  # ya existe
     except Exception:
         table = bigquery.Table(table_ref, schema=schema)
         table.time_partitioning = bigquery.TimePartitioning(field="eventDate")
@@ -147,7 +146,7 @@ def _fetch_day(d: date) -> List[Dict[str, Any]]:
             "sessions": int(met[2] or 0),
             "conversions": int(met[3] or 0),
             "purchaseRevenue": float(met[4] or 0.0),
-            "_ingested_at": bigquery.ScalarQueryParameter._to_json_value(None),  # filled by BQ
+            "_ingested_at": datetime.now(timezone.utc),  # <-- FIX: timestamp válido
         })
     return rows
 
@@ -163,10 +162,8 @@ def run_range(start: date, end: date):
     d = start
     one = timedelta(days=1)
     while d <= end:
-        # 1) pedimos a GA4
         rows = _fetch_day(d)
-        # 2) si hay filas, borramos partición del día y escribimos
         if rows:
-            _delete_day_from_bq(d)   # <- esto permite backfill sin duplicados
+            _delete_day_from_bq(d)   # evita duplicados al recargar un día
             _append_rows(rows)
         d += one
