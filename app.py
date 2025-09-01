@@ -152,3 +152,26 @@ def debug_bq():
         "max_date": row["max_date"],
         "total_rows": row["total_rows"],
     }
+PROJECT = os.environ["GCP_PROJECT"]
+DATASET = os.environ.get("BQ_DATASET", "analytics_app")
+TABLE = os.environ.get("BQ_TABLE_RAW", "events_daily_raw")
+TABLE_ID = f"{PROJECT}.{DATASET}.{TABLE}"
+
+@app.post("/backfill")
+def backfill(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    token: str = Query(""),
+):
+    expected = os.getenv("INGEST_TOKEN", "")
+    if expected and token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        s = _parse_date(start)
+        e = _parse_date(end)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Fechas inválidas")
+    if s > e:
+        raise HTTPException(status_code=400, detail="start <= end")
+    run_range(s, e)
+    return {"ok": True, "reloaded": {"start": s.isoformat(), "end": e.isoformat()}}
