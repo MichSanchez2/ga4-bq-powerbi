@@ -1,184 +1,104 @@
+# app.py
 from fastapi import FastAPI, HTTPException, Query
 from datetime import date, timedelta
 import os
 
-# GA4 -> BigQuery (tu pipeline real)
 from ga4_to_bq import run_range
-
-# --- DIAGNÓSTICO GA4 (API) ---
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import (
-    DateRange, Dimension, Metric, RunReportRequest
-)
-
-# --- DIAGNÓSTICO BQ ---
+from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
 from google.cloud import bigquery
 
-
-app = FastAPI(title="GA4 → BigQuery Ingest", version="1.0.0")
-
+app = FastAPI(title="GA4 → BigQuery Ingest", version="1.1.0")
 
 @app.get("/")
 def root():
-    """Ping simple para ver endpoints disponibles."""
-    return {
-        "ok": True,
-        "endpoints": ["/health", "/ingest", "/backfill", "/debug_ga", "/debug_bq", "/docs"]
-    }
-
+    return {"ok": True, "endpoints": ["/health", "/ingest", "/backfill", "/debug_ga", "/debug_bq"]}
 
 @app.get("/health")
 def health():
-    """Healthcheck para Render."""
     return {"status": "ok"}
 
-
 def _parse_date(x: str) -> date:
-    """Acepta 'yesterday' o YYYY-MM-DD."""
     if x == "yesterday":
         return date.today() - timedelta(days=1)
     return date.fromisoformat(x)
 
-
+# ---------------- Ingest / Backfill ----------------
 @app.api_route("/ingest", methods=["GET", "POST"])
 def ingest(
-    start: str = Query("yesterday", description="YYYY-MM-DD o 'yesterday'"),
-    end: str = Query("yesterday", description="YYYY-MM-DD o 'yesterday'"),
-    token: str = Query("", description="Debe coincidir con INGEST_TOKEN"),
+    start: str = Query("yesterday"),
+    end: str = Query("yesterday"),
+    token: str = Query(""),
+    simple: int = Query(0, description="1=simple (solo fecha+metricas)"),
 ):
-    """
-    Dispara la ingesta GA4 -> BigQuery para el rango [start, end].
-    Se protege con el token definido en la variable de entorno INGEST_TOKEN.
-    """
     expected = os.getenv("INGEST_TOKEN", "")
     if expected and token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    try:
-        s = _parse_date(start)
-        e = _parse_date(end)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Usa 'yesterday' o fecha YYYY-MM-DD")
-
+    s = _parse_date(start); e = _parse_date(end)
     if s > e:
-        raise HTTPException(status_code=400, detail="start debe ser <= end")
+        raise HTTPException(status_code=400, detail="start <= end")
+    run_range(s, e, simple=bool(simple))
+    return {"ok": True, "start": s.isoformat(), "end": e.isoformat(), "simple": bool(simple)}
 
-    try:
-        run_range(s, e)
-    except Exception as exc:
-        # mensaje breve para logs
-        raise HTTPException(status_code=500, detail=f"ingest failed: {exc.__class__.__name__}") from exc
+@app.api_route("/backfill", methods=["GET", "POST"])
+def backfill(
+    start: str = Query(...),
+    end: str = Query(...),
+    token: str = Query(""),
+    simple: int = Query(1, description="1=simple (recomendado para histórico)"),
+):
+    expected = os.getenv("INGEST_TOKEN", "")
+    if expected and token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    s = _parse_date(start); e = _parse_date(end)
+    if s > e:
+        raise HTTPException(status_code=400, detail="start <= end")
+    run_range(s, e, simple=bool(simple))
+    return {"ok": True, "reloaded": {"start": s.isoformat(), "end": e.isoformat()}, "simple": bool(simple)}
 
-    return {"ok": True, "start": s.isoformat(), "end": e.isoformat()}
-
-
-# =========================
-#   ENDPOINT /debug_ga
-# =========================
+# ---------------- Debug helpers ----------------
 @app.get("/debug_ga")
 def debug_ga(
-    d1: str = Query("2024-07-15", description="Fecha 1 (YYYY-MM-DD)"),
-    d2: str = Query("2025-07-15", description="Fecha 2 (YYYY-MM-DD)"),
+    d1: str = Query("2024-07-15"), d2: str = Query("2025-07-15")
 ):
-    """
-    Comprueba contra la GA4 Data API usando el property_id del backend.
-    Devuelve rowCount para dos fechas para comparar 2024 vs 2025.
-    """
-    property_id = os.getenv("GA4_PROPERTY_ID")
-    if not property_id:
-        raise HTTPException(status_code=500, detail="GA4_PROPERTY_ID no está definido")
-
+    pid = os.getenv("GA4_PROPERTY_ID")
+    if not pid:
+        raise HTTPException(status_code=500, detail="GA4_PROPERTY_ID not set")
     client = BetaAnalyticsDataClient()
 
-    def probe(date_str: str):
+    def probe(ds: str):
         req = RunReportRequest(
-            property=f"properties/{property_id}",
-            date_ranges=[DateRange(start_date=date_str, end_date=date_str)],
+            property=f"properties/{pid}",
+            date_ranges=[DateRange(start_date=ds, end_date=ds)],
             dimensions=[Dimension(name="date")],
             metrics=[Metric(name="sessions")],
         )
         resp = client.run_report(req)
-        return {
-            "date": date_str,
-            "rowCount": resp.row_count,
-            "sampleRow": [c.value for c in resp.rows[0].dimension_values] if resp.row_count else [],
-        }
+        return {"date": ds, "rowCount": resp.row_count,
+                "sampleRow": [c.value for c in resp.rows[0].dimension_values] if resp.row_count else []}
 
-    r1 = probe(d1)
-    r2 = probe(d2)
+    return {"config": {
+                "property_id": pid,
+                "gcp_project": os.getenv("GCP_PROJECT"),
+                "bq_dataset": os.getenv("BQ_DATASET"),
+                "bq_table_raw": os.getenv("BQ_TABLE_RAW"),
+            },
+            "checks": [probe(d1), probe(d2)]}
 
-    # Muestra también algunas variables no sensibles
-    cfg = {
-        "property_id": property_id,
-        "gcp_project": os.getenv("GCP_PROJECT"),
-        "bq_dataset": os.getenv("BQ_DATASET"),
-        "bq_table_raw": os.getenv("BQ_TABLE_RAW"),
-        # No exponemos secretos.
-    }
-    return {"config": cfg, "checks": [r1, r2]}
-
-
-# =========================
-#   ENDPOINT /debug_bq
-# =========================
 @app.get("/debug_bq")
 def debug_bq():
-    """
-    Verifica que la tabla de destino exista y devuelve MIN/MAX/COUNT.
-    """
     project = os.getenv("GCP_PROJECT")
     dataset = os.getenv("BQ_DATASET")
     table = os.getenv("BQ_TABLE_RAW")
     if not (project and dataset and table):
-        raise HTTPException(
-            status_code=500,
-            detail="Faltan GCP_PROJECT / BQ_DATASET / BQ_TABLE_RAW en variables de entorno",
-        )
-
+        raise HTTPException(status_code=500, detail="Missing GCP_PROJECT/BQ_DATASET/BQ_TABLE_RAW")
     client = bigquery.Client(project=project)
-    table_id = f"{project}.{dataset}.{table}"
     sql = f"""
-        SELECT
-          MIN(eventDate) AS min_date,
-          MAX(eventDate) AS max_date,
-          COUNT(*)       AS total_rows
-        FROM `{table_id}`
+        SELECT MIN(eventDate) AS min_date,
+               MAX(eventDate) AS max_date,
+               COUNT(*)       AS total_rows
+        FROM `{project}.{dataset}.{table}`
     """
-    job = client.query(sql)
-    row = list(job.result())[0]
-    return {
-        "table": table_id,
-        "min_date": row["min_date"],
-        "max_date": row["max_date"],
-        "total_rows": row["total_rows"],
-    }
-
-
-# (no es obligatorio, pero si necesitas estas constantes en otros módulos, déjalas aquí)
-PROJECT = os.environ["GCP_PROJECT"]
-DATASET = os.environ.get("BQ_DATASET", "analytics_app")
-TABLE = os.environ.get("BQ_TABLE_RAW", "events_daily_raw")
-TABLE_ID = f"{PROJECT}.{DATASET}.{TABLE}"
-
-
-# ==========================================
-#   BACKFILL (ahora acepta GET y POST)
-# ==========================================
-@app.api_route("/backfill", methods=["GET", "POST"])
-def backfill(
-    start: str = Query(..., description="YYYY-MM-DD"),
-    end: str = Query(..., description="YYYY-MM-DD"),
-    token: str = Query(""),
-):
-    expected = os.getenv("INGEST_TOKEN", "")
-    if expected and token != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        s = _parse_date(start)
-        e = _parse_date(end)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Fechas inválidas")
-    if s > e:
-        raise HTTPException(status_code=400, detail="start <= end")
-    run_range(s, e)
-    return {"ok": True, "reloaded": {"start": s.isoformat(), "end": e.isoformat()}}
+    row = list(client.query(sql).result())[0]
+    return {"table": f"{project}.{dataset}.{table}",
+            "min_date": row["min_date"], "max_date": row["max_date"], "total_rows": row["total_rows"]}
