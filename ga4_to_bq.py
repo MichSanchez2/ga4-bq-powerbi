@@ -21,7 +21,7 @@ TABLE_ID = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_RAW}"
 assert GA4_PROPERTY_ID,  "Falta GA4_PROPERTY_ID"
 assert GCP_PROJECT,      "Falta GCP_PROJECT"
 
-# ------------------------- Clientes -------------------------------
+# ------------------------- Clients -------------------------------
 def _ga_client() -> BetaAnalyticsDataClient:
     if CREDENTIALS_PATH:
         creds = service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
@@ -36,7 +36,7 @@ def _bq_client() -> bigquery.Client:
 
 # --------------------- BigQuery helpers ---------------------------
 def _ensure_table():
-    """Crea el dataset/tabla si no existen. Tabla particionada por eventDate."""
+    """Create dataset/table if not exist. Table is DATE-partitioned on eventDate."""
     bq = _bq_client()
     dataset_ref = bigquery.DatasetReference(GCP_PROJECT, BQ_DATASET)
     try:
@@ -53,14 +53,14 @@ def _ensure_table():
         bigquery.SchemaField("totalUsers", "INT64"),
         bigquery.SchemaField("activeUsers", "INT64"),
         bigquery.SchemaField("sessions", "INT64"),
-        bigquery.SchemaField("conversions", "FLOAT64"),     # FLOAT64
-        bigquery.SchemaField("purchaseRevenue", "FLOAT64"), # FLOAT64
+        bigquery.SchemaField("conversions", "FLOAT64"),
+        bigquery.SchemaField("purchaseRevenue", "FLOAT64"),
         bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
     ]
 
     table_ref = dataset_ref.table(BQ_TABLE_RAW)
     try:
-        _ = bq.get_table(table_ref)  # existe
+        _ = bq.get_table(table_ref)
         return
     except Exception:
         table = bigquery.Table(table_ref, schema=schema)
@@ -69,8 +69,7 @@ def _ensure_table():
 
 def _append_rows_partition(rows: List[Dict[str, Any]], d: date):
     """
-    Carga JSON directo a la partición del día usando WRITE_TRUNCATE.
-    NO usa DELETE (sin DML) — compatible con sandbox.
+    Load JSON into a single daily partition using WRITE_TRUNCATE (no DML).
     """
     if not rows:
         return
@@ -78,7 +77,6 @@ def _append_rows_partition(rows: List[Dict[str, Any]], d: date):
     bq = _bq_client()
     _ensure_table()
 
-    # Igual que la definición de tu tabla (eventDate = REQUIRED)
     schema = [
         bigquery.SchemaField("eventDate", "DATE", mode="REQUIRED"),
         bigquery.SchemaField("country", "STRING"),
@@ -98,12 +96,11 @@ def _append_rows_partition(rows: List[Dict[str, Any]], d: date):
         rows,
         dest,
         job_config=bigquery.LoadJobConfig(
-            schema=schema,  # <- fuerza REQUIRED y tipos correctos
+            schema=schema,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         ),
     )
     job.result()
-
 
 # ---------------------- GA4 helpers --------------------------------
 DIMENSIONS = [
@@ -132,6 +129,7 @@ def _to_float(x: Any) -> float:
     return float(x)
 
 def _fetch_day(d: date) -> List[Dict[str, Any]]:
+    """Detailed per-day pull with country/channel/source/event."""
     client = _ga_client()
     req = RunReportRequest(
         property=f"properties/{GA4_PROPERTY_ID}",
@@ -155,25 +153,63 @@ def _fetch_day(d: date) -> List[Dict[str, Any]]:
             "totalUsers": _to_int(met[0]),
             "activeUsers": _to_int(met[1]),
             "sessions": _to_int(met[2]),
-            "conversions": _to_float(met[3]),        # FLOAT64
-            "purchaseRevenue": _to_float(met[4]),    # FLOAT64
-            "_ingested_at": datetime.now(timezone.utc).isoformat(),  # p.ej. '2025-09-01T03:12:45.123456+00:00'
-
+            "conversions": _to_float(met[3]),
+            "purchaseRevenue": _to_float(met[4]),
+            "_ingested_at": datetime.now(timezone.utc).isoformat(),
         })
     return rows
 
-# ---------------------- API pública --------------------------------
-def run_range(start: date, end: date):
+def _fetch_range_simple(start: date, end: date) -> List[Dict[str, Any]]:
+    """Simple & fast: one call for [start,end], only date + metrics (good for 14m backfill)."""
+    client = _ga_client()
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name="date")],
+        metrics=[Metric(name=m) for m in METRICS],
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        limit=2000,
+    )
+    resp = client.run_report(req)
+    rows: List[Dict[str, Any]] = []
+    for r in resp.rows:
+        ymd = r.dimension_values[0].value  # 'YYYYMMDD'
+        mv = [v.value for v in r.metric_values]
+        rows.append({
+            "eventDate": f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}",
+            "country": None,
+            "sessionDefaultChannelGroup": None,
+            "sourceMedium": None,
+            "eventName": None,
+            "totalUsers": _to_int(mv[0]),
+            "activeUsers": _to_int(mv[1]),
+            "sessions": _to_int(mv[2]),
+            "conversions": _to_float(mv[3]),
+            "purchaseRevenue": _to_float(mv[4]),
+            "_ingested_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return rows
+
+# ---------------------- Public API --------------------------------
+def run_range(start: date, end: date, *, simple: bool = False):
     """
-    Carga cada día del rango [start, end] (inclusive).
-    Sin DML: se sobreescribe la partición del día con WRITE_TRUNCATE.
+    Load [start, end] inclusive.
+    - simple=False -> detailed day-by-day (uses DIMENSIONS)
+    - simple=True  -> fast range by date only; still writes per-day partitions
     """
     _ensure_table()
+
+    if simple:
+        all_rows = _fetch_range_simple(start, end)
+        for r in all_rows:
+            d = date.fromisoformat(r["eventDate"])
+            _append_rows_partition([r], d)
+        return
+
     d = start
     one = timedelta(days=1)
     while d <= end:
         rows = _fetch_day(d)
         if rows:
-            _append_rows_partition(rows, d)  # sin DELETE; sobreescribe partición
+            _append_rows_partition(rows, d)
         d += one
 
