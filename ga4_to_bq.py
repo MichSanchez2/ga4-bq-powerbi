@@ -70,24 +70,40 @@ def _ensure_table():
 def _append_rows_partition(rows: List[Dict[str, Any]], d: date):
     """
     Carga JSON directo a la partición del día usando WRITE_TRUNCATE.
-    >>> NO usa DELETE (sin DML)  — compatible con sandbox.
+    NO usa DELETE (sin DML) — compatible con sandbox.
     """
     if not rows:
         return
+
     bq = _bq_client()
     _ensure_table()
 
-    # Decorador de partición: table$YYYYMMDD
-    table_partition_id = f"{TABLE_ID}${d.strftime('%Y%m%d')}"
+    # Igual que la definición de tu tabla (eventDate = REQUIRED)
+    schema = [
+        bigquery.SchemaField("eventDate", "DATE", mode="REQUIRED"),
+        bigquery.SchemaField("country", "STRING"),
+        bigquery.SchemaField("sessionDefaultChannelGroup", "STRING"),
+        bigquery.SchemaField("sourceMedium", "STRING"),
+        bigquery.SchemaField("eventName", "STRING"),
+        bigquery.SchemaField("totalUsers", "INT64"),
+        bigquery.SchemaField("activeUsers", "INT64"),
+        bigquery.SchemaField("sessions", "INT64"),
+        bigquery.SchemaField("conversions", "FLOAT64"),
+        bigquery.SchemaField("purchaseRevenue", "FLOAT64"),
+        bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ]
 
+    dest = f"{TABLE_ID}${d.strftime('%Y%m%d')}"
     job = bq.load_table_from_json(
         rows,
-        table_partition_id,
+        dest,
         job_config=bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+            schema=schema,  # <- fuerza REQUIRED y tipos correctos
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         ),
     )
     job.result()
+
 
 # ---------------------- GA4 helpers --------------------------------
 DIMENSIONS = [
