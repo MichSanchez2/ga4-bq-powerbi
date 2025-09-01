@@ -3,14 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta, datetime, timezone
 import os
-from typing import Iterable, List, Dict, Any
+from typing import List, Dict, Any
 
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange, Dimension, Metric, RunReportRequest
 )
 from google.oauth2 import service_account
-
 from google.cloud import bigquery
 
 # ----------------------------- Config -----------------------------
@@ -59,7 +58,7 @@ def _ensure_table():
         bigquery.SchemaField("totalUsers", "INT64"),
         bigquery.SchemaField("activeUsers", "INT64"),
         bigquery.SchemaField("sessions", "INT64"),
-        bigquery.SchemaField("conversions", "INT64"),
+        bigquery.SchemaField("conversions", "FLOAT"),   # <- CAMBIO: FLOAT
         bigquery.SchemaField("purchaseRevenue", "FLOAT"),
         bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
     ]
@@ -133,20 +132,19 @@ def _fetch_day(d: date) -> List[Dict[str, Any]]:
     for r in resp.rows:
         dim = [v.value for v in r.dimension_values]
         met = [v.value for v in r.metric_values]
-        # GA devuelve fecha como 'YYYYMMDD'
-        ymd = dim[0]
+        ymd = dim[0]  # 'YYYYMMDD'
         rows.append({
             "eventDate": f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}",
             "country": dim[1] or None,
             "sessionDefaultChannelGroup": dim[2] or None,
             "sourceMedium": dim[3] or None,
             "eventName": dim[4] or None,
-            "totalUsers": int(met[0] or 0),
-            "activeUsers": int(met[1] or 0),
-            "sessions": int(met[2] or 0),
-            "conversions": int(met[3] or 0),
+            "totalUsers": int(float(met[0] or 0)),   # por si GA manda "12.0"
+            "activeUsers": int(float(met[1] or 0)),
+            "sessions": int(float(met[2] or 0)),
+            "conversions": float(met[3] or 0.0),     # <- CAMBIO: float
             "purchaseRevenue": float(met[4] or 0.0),
-            "_ingested_at": datetime.now(timezone.utc),  # <-- FIX: timestamp válido
+            "_ingested_at": datetime.now(timezone.utc),
         })
     return rows
 
@@ -158,7 +156,6 @@ def run_range(start: date, end: date):
     **Backfill idempotente**: antes de cargar un día, se borra su partición.
     """
     _ensure_table()
-
     d = start
     one = timedelta(days=1)
     while d <= end:
@@ -167,3 +164,4 @@ def run_range(start: date, end: date):
             _delete_day_from_bq(d)   # evita duplicados al recargar un día
             _append_rows(rows)
         d += one
+
