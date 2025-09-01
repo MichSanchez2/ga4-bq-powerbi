@@ -23,7 +23,7 @@ def root():
     """Ping simple para ver endpoints disponibles."""
     return {
         "ok": True,
-        "endpoints": ["/health", "/ingest", "/debug_ga", "/debug_bq", "/docs"]
+        "endpoints": ["/health", "/ingest", "/backfill", "/debug_ga", "/debug_bq", "/docs"]
     }
 
 
@@ -152,12 +152,19 @@ def debug_bq():
         "max_date": row["max_date"],
         "total_rows": row["total_rows"],
     }
+
+
+# (no es obligatorio, pero si necesitas estas constantes en otros módulos, déjalas aquí)
 PROJECT = os.environ["GCP_PROJECT"]
 DATASET = os.environ.get("BQ_DATASET", "analytics_app")
 TABLE = os.environ.get("BQ_TABLE_RAW", "events_daily_raw")
 TABLE_ID = f"{PROJECT}.{DATASET}.{TABLE}"
 
-@app.post("/backfill")
+
+# ==========================================
+#   BACKFILL (ahora acepta GET y POST)
+# ==========================================
+@app.api_route("/backfill", methods=["GET", "POST"])
 def backfill(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
