@@ -141,7 +141,8 @@ def _fetch_day(d: date) -> List[Dict[str, Any]]:
             "sessions": _to_int(met[2]),
             "conversions": _to_float(met[3]),        # FLOAT64
             "purchaseRevenue": _to_float(met[4]),    # FLOAT64
-            "_ingested_at": datetime.now(timezone.utc),
+            "_ingested_at": datetime.now(timezone.utc).isoformat(),  # p.ej. '2025-09-01T03:12:45.123456+00:00'
+
         })
     return rows
 
