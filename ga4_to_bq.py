@@ -1,118 +1,172 @@
-#!/usr/bin/env python3
-import os, sys, time, argparse
-from datetime import date, datetime, timedelta
+# ga4_to_bq.py
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import date, timedelta
+import os
+from typing import Iterable, List, Dict, Any
+
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Dimension, Metric
+from google.analytics.data_v1beta.types import (
+    DateRange, Dimension, Metric, RunReportRequest
+)
+from google.oauth2 import service_account
+
 from google.cloud import bigquery
 
-# --------- ENV / Defaults ----------
-GA4_PROPERTY_ID = os.getenv("GA4_PROPERTY_ID", "").strip()
-GCP_PROJECT = os.getenv("GCP_PROJECT", "").strip()
-BQ_DATASET = os.getenv("BQ_DATASET", "analytics_app").strip()
-BQ_TABLE_RAW = os.getenv("BQ_TABLE_RAW", "events_daily_raw").strip()
-GA4_CREDENTIALS_PATH = os.getenv("GA4_CREDENTIALS_PATH", "/etc/secrets/ga4-credentials.json")
+# ----------------------------- Config -----------------------------
 
-# Para Render Secret Files
-if GA4_CREDENTIALS_PATH and os.path.exists(GA4_CREDENTIALS_PATH):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GA4_CREDENTIALS_PATH
+GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID") or os.environ.get("GA4_PROPERTY_ID".lower())
+GCP_PROJECT     = os.environ.get("GCP_PROJECT")
+BQ_DATASET      = os.environ.get("BQ_DATASET", "analytics_app")
+BQ_TABLE_RAW    = os.environ.get("BQ_TABLE_RAW", "events_daily_raw")
+CREDENTIALS_PATH= os.environ.get("GA4_CREDENTIALS_PATH") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 
-if not GA4_PROPERTY_ID or not GCP_PROJECT:
-    print("ERROR: set GA4_PROPERTY_ID and GCP_PROJECT env vars", file=sys.stderr)
-    sys.exit(2)
+TABLE_ID = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_RAW}"
 
-DIMENSIONS = ["date","country","sessionDefaultChannelGroup","sourceMedium","eventName"]
-METRICS    = ["totalUsers","activeUsers","sessions","conversions","purchaseRevenue"]
-LIMIT = 100000  # GA4 Data API usa offset/limit
+assert GA4_PROPERTY_ID,  "Falta GA4_PROPERTY_ID"
+assert GCP_PROJECT,      "Falta GCP_PROJECT"
 
-bq = bigquery.Client(project=GCP_PROJECT)
-ga = BetaAnalyticsDataClient()
-table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_RAW}"
+# ------------------------- Clientes -------------------------------
 
-def ensure_bq():
-    dataset_ref = bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}")
+def _ga_client() -> BetaAnalyticsDataClient:
+    if CREDENTIALS_PATH:
+        creds = service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
+        return BetaAnalyticsDataClient(credentials=creds)
+    return BetaAnalyticsDataClient()
+
+def _bq_client() -> bigquery.Client:
+    if CREDENTIALS_PATH:
+        creds = service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
+        return bigquery.Client(project=GCP_PROJECT, credentials=creds)
+    return bigquery.Client(project=GCP_PROJECT)
+
+# --------------------- BigQuery helpers ---------------------------
+
+def _ensure_table():
+    bq = _bq_client()
+    dataset_ref = bigquery.DatasetReference(GCP_PROJECT, BQ_DATASET)
     try:
         bq.get_dataset(dataset_ref)
     except Exception:
-        bq.create_dataset(dataset_ref, exists_ok=True)
-    schema=[bigquery.SchemaField("eventDate","DATE",mode="REQUIRED"),
-            bigquery.SchemaField("country","STRING"),
-            bigquery.SchemaField("sessionDefaultChannelGroup","STRING"),
-            bigquery.SchemaField("sourceMedium","STRING"),
-            bigquery.SchemaField("eventName","STRING"),
-            bigquery.SchemaField("totalUsers","INTEGER"),
-            bigquery.SchemaField("activeUsers","INTEGER"),
-            bigquery.SchemaField("sessions","INTEGER"),
-            bigquery.SchemaField("conversions","INTEGER"),
-            bigquery.SchemaField("purchaseRevenue","FLOAT"),
-            bigquery.SchemaField("_ingested_at","TIMESTAMP")]
-    table = bigquery.Table(table_id, schema=schema)
-    table.time_partitioning = bigquery.TimePartitioning(field="eventDate")
+        bq.create_dataset(bigquery.Dataset(dataset_ref), exists_ok=True)
+
+    schema = [
+        bigquery.SchemaField("eventDate", "DATE", mode="REQUIRED"),
+        bigquery.SchemaField("country", "STRING"),
+        bigquery.SchemaField("sessionDefaultChannelGroup", "STRING"),
+        bigquery.SchemaField("sourceMedium", "STRING"),
+        bigquery.SchemaField("eventName", "STRING"),
+        bigquery.SchemaField("totalUsers", "INT64"),
+        bigquery.SchemaField("activeUsers", "INT64"),
+        bigquery.SchemaField("sessions", "INT64"),
+        bigquery.SchemaField("conversions", "INT64"),
+        bigquery.SchemaField("purchaseRevenue", "FLOAT"),
+        bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ]
+
+    table_ref = dataset_ref.table(BQ_TABLE_RAW)
     try:
-        bq.get_table(table_id)
+        table = bq.get_table(table_ref)
+        # si existe, nada
+        return
     except Exception:
-        bq.create_table(table)
+        table = bigquery.Table(table_ref, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(field="eventDate")
+        bq.create_table(table, exists_ok=True)
 
-def run_day(d_iso: str):
-    rows_out=[]; offset=0; total=None
-    while True:
-        req = RunReportRequest(
-            property=f"properties/{GA4_PROPERTY_ID}" if not GA4_PROPERTY_ID.startswith("properties/") else GA4_PROPERTY_ID,
-            dimensions=[Dimension(name=x) for x in DIMENSIONS],
-            metrics=[Metric(name=x) for x in METRICS],
-            date_ranges=[DateRange(start_date=d_iso, end_date=d_iso)],
-            limit=LIMIT,
-            offset=offset
-        )
-        resp = ga.run_report(req)
-        if total is None:
-            total = resp.row_count
+def _delete_day_from_bq(d: date):
+    """Backfill seguro: borra la partición del día antes de cargarla."""
+    bq = _bq_client()
+    sql = f"""
+    DELETE FROM `{TABLE_ID}`
+    WHERE eventDate = @d
+    """
+    job = bq.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", d)]
+        ),
+    )
+    job.result()
 
-        for r in resp.rows:
-            dv = {DIMENSIONS[i]: r.dimension_values[i].value for i in range(len(DIMENSIONS))}
-            mv = {METRICS[i]   : float(r.metric_values[i].value or 0) for i in range(len(METRICS))}
-            rows_out.append({
-                "eventDate": d_iso,
-                "country": dv.get("country"),
-                "sessionDefaultChannelGroup": dv.get("sessionDefaultChannelGroup"),
-                "sourceMedium": dv.get("sourceMedium"),
-                "eventName": dv.get("eventName"),
-                "totalUsers": int(mv.get("totalUsers",0)),
-                "activeUsers": int(mv.get("activeUsers",0)),
-                "sessions": int(mv.get("sessions",0)),
-                "conversions": int(mv.get("conversions",0)),
-                "purchaseRevenue": float(mv.get("purchaseRevenue",0.0)),
-                "_ingested_at": datetime.utcnow().isoformat()
-            })
+def _append_rows(rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    bq = _bq_client()
+    _ensure_table()
+    job = bq.load_table_from_json(
+        rows,
+        TABLE_ID,
+        job_config=bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND
+        ),
+    )
+    job.result()
 
-        fetched = offset + len(resp.rows)
-        if fetched >= resp.row_count or len(resp.rows)==0:
-            break
-        offset += len(resp.rows)
-        time.sleep(0.5)
+# ---------------------- GA4 helpers --------------------------------
 
-    if rows_out:
-        bq.load_table_from_json(rows_out, table_id).result()
+DIMENSIONS = [
+    "date",
+    "country",
+    "sessionDefaultChannelGroup",
+    "sourceMedium",
+    "eventName",
+]
+METRICS = [
+    "totalUsers",
+    "activeUsers",
+    "sessions",
+    "conversions",
+    "purchaseRevenue",
+]
 
-def run_range(start_date: date, end_date: date):
-    ensure_bq()
-    d = start_date
-    while d <= end_date:
-        print(f"Ingesting {d} ...")
-        run_day(d.isoformat())
-        d += timedelta(days=1)
-    print("DONE")
+def _fetch_day(d: date) -> List[Dict[str, Any]]:
+    client = _ga_client()
+    req = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        dimensions=[Dimension(name=n) for n in DIMENSIONS],
+        metrics=[Metric(name=n) for n in METRICS],
+        date_ranges=[DateRange(start_date=d.isoformat(), end_date=d.isoformat())],
+        limit=100000,
+    )
+    resp = client.run_report(req)
+    rows: List[Dict[str, Any]] = []
+    for r in resp.rows:
+        dim = [v.value for v in r.dimension_values]
+        met = [v.value for v in r.metric_values]
+        # GA devuelve fecha como 'YYYYMMDD'
+        ymd = dim[0]
+        rows.append({
+            "eventDate": f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}",
+            "country": dim[1] or None,
+            "sessionDefaultChannelGroup": dim[2] or None,
+            "sourceMedium": dim[3] or None,
+            "eventName": dim[4] or None,
+            "totalUsers": int(met[0] or 0),
+            "activeUsers": int(met[1] or 0),
+            "sessions": int(met[2] or 0),
+            "conversions": int(met[3] or 0),
+            "purchaseRevenue": float(met[4] or 0.0),
+            "_ingested_at": bigquery.ScalarQueryParameter._to_json_value(None),  # filled by BQ
+        })
+    return rows
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--start", help="YYYY-MM-DD o 'yesterday'", default="yesterday")
-    p.add_argument("--end",   help="YYYY-MM-DD o 'yesterday'", default="yesterday")
-    return p.parse_args()
+# ---------------------- API pública --------------------------------
 
-if __name__ == "__main__":
-    args = parse_args()
-    def parse_one(x):
-        if x == "yesterday": return date.today() - timedelta(days=1)
-        return date.fromisoformat(x)
-    s = parse_one(args.start)
-    e = parse_one(args.end)
-    run_range(s, e)
+def run_range(start: date, end: date):
+    """
+    Carga cada día del rango [start, end] (inclusive).
+    **Backfill idempotente**: antes de cargar un día, se borra su partición.
+    """
+    _ensure_table()
+
+    d = start
+    one = timedelta(days=1)
+    while d <= end:
+        # 1) pedimos a GA4
+        rows = _fetch_day(d)
+        # 2) si hay filas, borramos partición del día y escribimos
+        if rows:
+            _delete_day_from_bq(d)   # <- esto permite backfill sin duplicados
+            _append_rows(rows)
+        d += one
